@@ -6,7 +6,10 @@
 
 #include "umd/device/tt_device/protocol/pcie_dma/blackhole_dma_transfer.hpp"
 
+#include <fmt/base.h>
+
 #include <chrono>
+#include <cstdlib>
 #include <string>
 
 #include "umd/device/pcie/pci_device.hpp"
@@ -15,8 +18,79 @@
 namespace tt::umd {
 
 void BlackholeDmaTransfer::d2h_transfer(
-    volatile uint8_t* /*bar2*/, DmaBuffer& /*dma_buffer*/, uint64_t /*dst*/, uint32_t /*src*/, size_t /*size*/) {
-    UMD_THROW(error::RuntimeError, "D2H DMA transfer is not supported on Blackhole.");
+    volatile uint8_t* bar2, DmaBuffer& dma_buffer, uint64_t dst, uint32_t src, size_t size) {
+    // device->host DMA on Blackhole. The BH controller exposes 16 channel blocks (BAR2 stride 0x100) as 8
+    // interleaved read/write pairs: EVEN blocks (0x000,0x200,...) are write channels (device->host), ODD
+    // blocks (0x100,0x300,...) are read channels (host->device, used by h2d). D2H is the h2d register
+    // sequence with source/dest swapped — SAR = device AXI (32-bit), DAR = host physical (64-bit) — on a
+    // write channel. Use write channel 0 (0x000); h2d uses read channel 0 (0x100), so the two never collide.
+    // Verified bit-exact on Blackhole p150a, 2026-07-07.
+    uint32_t base = 0x000;
+    if (const char* e = std::getenv("TT_D2H_CH")) {
+        base = static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
+    }
+    const uint32_t EN_OFF = base + 0x00;
+    const uint32_t DOORBELL_OFF = base + 0x04;
+    const uint32_t XFERSIZE_OFF = base + 0x1C;
+    const uint32_t SAR_LOW_OFF = base + 0x20;
+    const uint32_t SAR_HIGH_OFF = base + 0x24;
+    const uint32_t DAR_LOW_OFF = base + 0x28;
+    const uint32_t DAR_HIGH_OFF = base + 0x2C;
+    const uint32_t INT_SETUP_OFF = base + 0x88;
+    const uint32_t MSI_STOP_LOW_OFF = base + 0x90;
+    const uint32_t MSI_STOP_HIGH_OFF = base + 0x94;
+    const uint32_t MSI_ABORT_LOW_OFF = base + 0xA0;
+    const uint32_t MSI_ABORT_HIGH_OFF = base + 0xA4;
+    const uint32_t MSI_MSGD_OFF = base + 0xA8;
+    static constexpr uint32_t DMA_TIMEOUT_MS = 10000;
+
+    auto write_reg = [&](uint32_t offset, uint32_t value) {
+        *reinterpret_cast<volatile uint32_t*>(bar2 + offset) = value;
+    };
+    auto read_reg = [&](uint32_t offset) -> uint32_t { return *reinterpret_cast<volatile uint32_t*>(bar2 + offset); };
+
+    write_reg(INT_SETUP_OFF, 0x28);
+    write_reg(MSI_STOP_LOW_OFF, static_cast<uint32_t>(dma_buffer.completion_pa & 0xFFFFFFFF));
+    write_reg(MSI_STOP_HIGH_OFF, static_cast<uint32_t>((dma_buffer.completion_pa >> 32) & 0xFFFFFFFF));
+    write_reg(MSI_ABORT_LOW_OFF, static_cast<uint32_t>((dma_buffer.completion_pa + sizeof(uint32_t)) & 0xFFFFFFFF));
+    write_reg(
+        MSI_ABORT_HIGH_OFF,
+        static_cast<uint32_t>(((dma_buffer.completion_pa + sizeof(uint32_t)) >> 32) & 0xFFFFFFFF));
+    // Ordered completion: have the engine write a magic value to the host completion flag when done. Because
+    // that write is issued AFTER the data writes on the same path, PCIe ordering guarantees all D2H data has
+    // landed in host DRAM once the CPU observes the magic (polling the device XFERSIZE register does NOT).
+    static constexpr uint32_t DMA_COMPLETION_VALUE = 0xfaca;
+    const bool wait_xfersize = std::getenv("TT_D2H_WAIT_XFER") != nullptr;  // A/B: old (unordered) path
+    volatile uint32_t* completion = reinterpret_cast<volatile uint32_t*>(dma_buffer.completion);
+    *completion = 0;
+    write_reg(MSI_MSGD_OFF, DMA_COMPLETION_VALUE);
+    write_reg(EN_OFF, 0x1);
+    // Source = device AXI address (BH uses a 32-bit device address space).
+    write_reg(SAR_LOW_OFF, src);
+    write_reg(SAR_HIGH_OFF, 0);
+    // Destination = host physical address (64-bit).
+    write_reg(DAR_LOW_OFF, static_cast<uint32_t>(dst & 0xFFFFFFFF));
+    write_reg(DAR_HIGH_OFF, static_cast<uint32_t>((dst >> 32) & 0xFFFFFFFF));
+    // Set transfer size and ring the doorbell to start the DMA.
+    write_reg(XFERSIZE_OFF, static_cast<uint32_t>(size));
+    write_reg(DOORBELL_OFF, 0x1);
+
+    auto start = std::chrono::steady_clock::now();
+    for (;;) {
+        bool done = wait_xfersize ? (read_reg(XFERSIZE_OFF) == 0) : (*completion == DMA_COMPLETION_VALUE);
+        if (done) {
+            break;
+        }
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+        if (elapsed_ms > DMA_TIMEOUT_MS) {
+            UMD_THROW(error::RuntimeError, "D2H DMA timeout.");
+        }
+    }
+    if (std::getenv("TT_D2H_DEBUG")) {
+        fmt::print(
+            stderr, "[d2h] completion=0x{:x} xfersize=0x{:x}\n", *completion, read_reg(XFERSIZE_OFF));
+    }
 }
 
 void BlackholeDmaTransfer::h2d_transfer(
