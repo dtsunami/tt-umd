@@ -77,6 +77,9 @@ private:
 
     void dma_d2h_transfer(uint64_t dst, uint32_t src, size_t size);
     void dma_h2d_transfer(uint32_t dst, uint64_t src, size_t size);
+    // Blackhole-only: split one D2H into num_channels concurrent transfers across the even (write) channels,
+    // each with its own device-source offset, host staging slice, and completion flag. Experimental.
+    void dma_d2h_multichannel(uint64_t dst_pa, uint32_t src_axi, size_t size, uint32_t num_channels);
 
     enum class DmaDirection { H2D, D2H };
     tlb_data create_dma_tlb_config(

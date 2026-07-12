@@ -6,7 +6,11 @@
 
 #include "umd/device/tt_device/protocol/pcie_protocol.hpp"
 
+#include <fmt/base.h>
+
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -235,7 +239,15 @@ bool PcieProtocol::dma_transfer(void* buffer, size_t size, uint64_t addr, tlb_da
             std::memcpy(dma_buffer.buffer, buf, transfer_size);
             dma_h2d_transfer(static_cast<uint32_t>(axi_address), dma_buffer.buffer_pa, transfer_size);
         } else {
-            dma_d2h_transfer(dma_buffer.buffer_pa, static_cast<uint32_t>(axi_address), transfer_size);
+            const char* e = std::getenv("TT_D2H_CHANNELS");
+            if (e) {  // experimental multi-channel path (also used for N=1 to get engine-only timing)
+                uint32_t num_channels =
+                    std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(e, nullptr, 0)), 1u, 8u);
+                dma_d2h_multichannel(
+                    dma_buffer.buffer_pa, static_cast<uint32_t>(axi_address), transfer_size, num_channels);
+            } else {
+                dma_d2h_transfer(dma_buffer.buffer_pa, static_cast<uint32_t>(axi_address), transfer_size);
+            }
             std::memcpy(buf, dma_buffer.buffer, transfer_size);
         }
 
@@ -321,6 +333,78 @@ void PcieProtocol::dma_d2h_transfer(const uint64_t dst, const uint32_t src, cons
     }
 
     std::visit([&](auto& strategy) { strategy.d2h_transfer(bar2, dma_buffer, dst, src, size); }, dma_strategy_);
+}
+
+// Blackhole multi-channel D2H: split [src_axi, +size) across num_channels even (write) channels, each writing
+// its slice into a contiguous region of the host staging buffer, then wait on per-channel completion flags.
+// The BH controller has 16 channel blocks (BAR2 stride 0x100) = 8 write (even) + 8 read (odd); see
+// blackhole_dma_transfer.cpp. Register offsets within a channel: +0x00 EN, +0x04 DOORBELL, +0x1C XFERSIZE,
+// +0x20/24 SAR, +0x28/2C DAR, +0x88 INT_SETUP, +0x90/94 MSI_STOP, +0xA0/A4 MSI_ABORT, +0xA8 MSGD.
+void PcieProtocol::dma_d2h_multichannel(uint64_t dst_pa, uint32_t src_axi, size_t size, uint32_t num_channels) {
+    DmaBuffer& dma_buffer = pci_device_->get_dma_buffer();
+    volatile uint8_t* bar2 = reinterpret_cast<volatile uint8_t*>(pci_device_->bar2_uc);
+    if (!dma_buffer.completion || !dma_buffer.buffer || !bar2) {
+        UMD_THROW(error::RuntimeError, "DMA buffer/BAR2 not initialized.");
+    }
+    static constexpr uint32_t DMA_COMPLETION_VALUE = 0xfaca;
+    static constexpr uint32_t DMA_TIMEOUT_MS = 10000;
+    auto wr = [&](uint32_t off, uint32_t v) { *reinterpret_cast<volatile uint32_t*>(bar2 + off) = v; };
+
+    // Uniform per-channel slice (4-byte aligned); the last channel absorbs the remainder.
+    size_t slice = (size / num_channels) & ~size_t(3);
+    if (slice == 0) {  // too small to split — fall back to single channel
+        dma_d2h_transfer(dst_pa, src_axi, size);
+        return;
+    }
+
+    auto completion_ptr = [&](uint32_t i) {
+        return reinterpret_cast<volatile uint32_t*>(dma_buffer.completion + i * 64);
+    };
+
+    // Phase 1: program every channel (no doorbell yet) so they can all launch back-to-back.
+    for (uint32_t i = 0; i < num_channels; i++) {
+        uint32_t chbase = i * 0x200;  // even (write) channels: 0x000, 0x200, ... 0xE00
+        size_t off = static_cast<size_t>(i) * slice;
+        size_t this_size = (i == num_channels - 1) ? (size - off) : slice;
+        uint64_t comp_pa = dma_buffer.completion_pa + i * 64;
+        *completion_ptr(i) = 0;
+        wr(chbase + 0x88, 0x28);  // INT_SETUP
+        wr(chbase + 0x90, static_cast<uint32_t>(comp_pa & 0xFFFFFFFF));
+        wr(chbase + 0x94, static_cast<uint32_t>((comp_pa >> 32) & 0xFFFFFFFF));
+        wr(chbase + 0xA0, static_cast<uint32_t>((comp_pa + 4) & 0xFFFFFFFF));
+        wr(chbase + 0xA4, static_cast<uint32_t>(((comp_pa + 4) >> 32) & 0xFFFFFFFF));
+        wr(chbase + 0xA8, DMA_COMPLETION_VALUE);
+        wr(chbase + 0x00, 0x1);                                              // EN
+        wr(chbase + 0x20, src_axi + static_cast<uint32_t>(off));             // SAR = device source
+        wr(chbase + 0x24, 0);
+        wr(chbase + 0x28, static_cast<uint32_t>((dst_pa + off) & 0xFFFFFFFF));  // DAR = host staging slice
+        wr(chbase + 0x2C, static_cast<uint32_t>(((dst_pa + off) >> 32) & 0xFFFFFFFF));
+        wr(chbase + 0x1C, static_cast<uint32_t>(this_size));                 // XFERSIZE
+    }
+    // Phase 2: ring all doorbells (channels run concurrently from here).
+    auto t0 = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < num_channels; i++) {
+        wr(i * 0x200 + 0x04, 0x1);
+    }
+    // Phase 3: wait on every channel's host completion flag.
+    for (uint32_t i = 0; i < num_channels; i++) {
+        while (*completion_ptr(i) != DMA_COMPLETION_VALUE) {
+            auto el = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+            if (el > DMA_TIMEOUT_MS) {
+                UMD_THROW(error::RuntimeError, "Multi-channel D2H DMA timeout.");
+            }
+        }
+    }
+    if (std::getenv("TT_D2H_DEBUG")) {
+        double us = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count() /
+                    1000.0;
+        fmt::print(stderr, "[d2h-multi] {} ch, {} bytes, engine-only {:.1f}us = {:.2f} GB/s\n",
+                   num_channels, size, us, static_cast<double>(size) / (us * 1e3));
+    }
 }
 
 void PcieProtocol::dma_h2d_transfer(const uint32_t dst, const uint64_t src, const size_t size) {
